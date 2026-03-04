@@ -97,12 +97,66 @@ SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
 mcp = FastMCP("telegram")
 
+class ReconnectingClient:
+    """Proxy that auto-reconnects Telethon client on ConnectionError."""
+
+    def __init__(self, real_client: TelegramClient):
+        self._client = real_client
+        self._lock = asyncio.Lock()
+
+    async def ensure_connected(self):
+        if not self._client.is_connected():
+            async with self._lock:
+                if not self._client.is_connected():
+                    await self._client.connect()
+                    if not await self._client.is_user_authorized():
+                        raise ConnectionError("Telethon session expired — re-auth required")
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if not callable(attr) or not asyncio.iscoroutinefunction(attr):
+            return attr
+
+        async def wrapper(*args, **kwargs):
+            await self.ensure_connected()
+            try:
+                return await attr(*args, **kwargs)
+            except ConnectionError:
+                await self.ensure_connected()
+                return await attr(*args, **kwargs)
+
+        return wrapper
+
+    def __call__(self, *args, **kwargs):
+        """Support client(request) pattern used by Telethon for raw API calls."""
+        async def call_wrapper():
+            await self.ensure_connected()
+            try:
+                return await self._client(*args, **kwargs)
+            except ConnectionError:
+                await self.ensure_connected()
+                return await self._client(*args, **kwargs)
+
+        return call_wrapper()
+
+    def iter_messages(self, *args, **kwargs):
+        """Delegate iter_messages (async generator, not a coroutine)."""
+        return self._client.iter_messages(*args, **kwargs)
+
+    def iter_dialogs(self, *args, **kwargs):
+        """Delegate iter_dialogs (async generator, not a coroutine)."""
+        return self._client.iter_dialogs(*args, **kwargs)
+
+    def iter_participants(self, *args, **kwargs):
+        """Delegate iter_participants (async generator, not a coroutine)."""
+        return self._client.iter_participants(*args, **kwargs)
+
+
 if SESSION_STRING:
-    # Use the string session if available
-    client = TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    _raw_client = TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH)
 else:
-    # Use file-based session
-    client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    _raw_client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+client = ReconnectingClient(_raw_client)
 
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
@@ -4612,7 +4666,7 @@ async def _main() -> None:
     try:
         # Start the Telethon client non-interactively
         print("Starting Telegram client...")
-        await client.start()
+        await client._client.start()
 
         print("Telegram client started. Running MCP server...")
         # Use the asynchronous entrypoint instead of mcp.run()
