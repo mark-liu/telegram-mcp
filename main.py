@@ -4809,26 +4809,40 @@ async def reorder_folders(folder_ids: List[int]) -> str:
 
 
 async def _main() -> None:
+    # Warm the Telegram client in the background so the MCP server can answer
+    # the `initialize` handshake immediately. Telethon's connect + get_dialogs
+    # round-trip takes 3-8s; if it runs before mcp.run_stdio_async(), Claude
+    # Code's MCP init timeout fires before the server ever reads stdin and the
+    # server is marked as failed on every session.
+    #
+    # Safe to defer: every tool call goes through ensure_connected
+    # (ReconnectingClientProxy), and resolve_entity already handles cold
+    # StringSession cache by calling get_dialogs on miss. Tool calls arriving
+    # before warm_client completes simply await the connection.
+    async def warm_client() -> None:
+        try:
+            print("Starting Telegram client...", file=sys.stderr)
+            await client._client.start()
+            print("Warming entity cache...", file=sys.stderr)
+            await client.get_dialogs()
+            print("Telegram client ready.", file=sys.stderr)
+        except Exception as e:
+            print(f"Background warm failed: {e}", file=sys.stderr)
+            if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
+                print(
+                    "Database lock detected. Please ensure no other instances are running.",
+                    file=sys.stderr,
+                )
+
     try:
-        # Start the Telethon client non-interactively
-        print("Starting Telegram client...", file=sys.stderr)
-        await client._client.start()
-
-        # Warm entity cache — StringSession has no persistent cache,
-        # so fetch all dialogs once to populate it
-        print("Warming entity cache...", file=sys.stderr)
-        await client.get_dialogs()
-
-        print("Telegram client started. Running MCP server...", file=sys.stderr)
-        # Use the asynchronous entrypoint instead of mcp.run()
+        # Keep a named reference — bare create_task() is eligible for GC while
+        # mcp.run_stdio_async() blocks, which can silently cancel the warm.
+        warm_task = asyncio.create_task(warm_client())
+        print("Running MCP server...", file=sys.stderr)
         await mcp.run_stdio_async()
+        warm_task.cancel()
     except Exception as e:
-        print(f"Error starting client: {e}", file=sys.stderr)
-        if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
-            print(
-                "Database lock detected. Please ensure no other instances are running.",
-                file=sys.stderr,
-            )
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
 
